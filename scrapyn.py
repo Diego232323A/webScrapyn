@@ -1,5 +1,5 @@
 from playwright.sync_api import sync_playwright
-import re
+import re, csv, os
 
 def scrape_instagram_profile(target_user):
     with sync_playwright() as p:
@@ -8,80 +8,83 @@ def scrape_instagram_profile(target_user):
         page = context.new_page()
 
         try:
-            print(f"Accediendo al perfil de: {target_user}...")
-            page.goto(f"https://www.instagram.com/{target_user}/", wait_until="networkidle")
-            page.wait_for_selector("header", timeout=10000)
+            print(f"🕵️ Investigando a: {target_user}...")
+            page.goto(f"https://www.instagram.com/{target_user}/", wait_until="domcontentloaded", timeout=60000)
             
-            # 1. Extraemos todo el texto del encabezado
+            # Esperar a que el perfil cargue
+            page.wait_for_selector("header", timeout=15000)
+            page.mouse.wheel(0, 400) # Un pequeño scroll para activar la carga
+            page.wait_for_timeout(2000)
+
+            # --- 1. EXTRACCIÓN DE BIO MEJORADA ---
+            # Buscamos el contenedor específico de la biografía
+            bio_container = page.locator("section main header section > div:nth-child(3)").first
+            bio_text = bio_container.inner_text() if bio_container.count() > 0 else "Sin biografía"
+            
+            # Limpiamos la bio de palabras basura
+            blacklist = ["seguido por", "verificado", "verificar", "seguir"]
+            bio_final = " ".join([l for l in bio_text.split('\n') if not any(b in l.lower() for b in blacklist)])
+
+            # --- 2. EXTRACCIÓN DE NÚMEROS (POSTS, FOLLOWERS) ---
             header_text = page.locator("header").inner_text()
-            lines = [l.strip() for l in header_text.split('\n') if l.strip()]
+            posts_count = re.search(r'([\d.,]+)\s+publicaciones', header_text)
+            followers = re.search(r'([\d.,]+)\s+seguidores', header_text)
+            following = re.search(r'([\d.,]+)\s+seguidos', header_text)
 
-            # 2. Extraer números con Regex (esto no falla)
-            posts = re.search(r'(\d+)\s+publicaciones', header_text)
-            followers = re.search(r'(\d+)\s+seguidores', header_text)
-            following = re.search(r'(\d+)\s+seguidos', header_text)
-
-            # 3. Lógica para el Nombre y la Bio
-            # El nombre es casi siempre la línea después del username
-            username_idx = -1
-            for i, line in enumerate(lines):
-                if target_user in line.lower():
-                    username_idx = i
-                    break
+            # --- 3. EXTRACCIÓN DE POSTS (MÉTODO ROBUSTO) ---
+            print("📸 Analizando fotos y estadísticas...")
+            posts_info_list = []
             
-            nombre_real = lines[username_idx + 1] if username_idx != -1 else "No encontrado"
-
-            # 4. Capturar la Bio
-            # Buscamos qué hay entre las estadísticas y los botones
-            # Vamos a filtrar líneas que ya conocemos
-            palabras_clave = ["publicaciones", "seguidores", "seguidos", "siguiendo","destacada", "mensaje", "enviar mensaje", target_user]
+            # Buscamos los contenedores de los posts
+            fotos = page.locator("a[href*='/p/']").all()
             
-            bio_parts = []
-            for line in lines:
-                # Si la línea no es el nombre real y no tiene palabras clave, es la BIO
-                if line != nombre_real and not any(key in line.lower() for key in palabras_clave):
-                    # Ignorar también el texto de "seguido por..." si prefieres
-                    if "sigue esta cuenta" not in line.lower():
-                        bio_parts.append(line)
+            for i, foto in enumerate(fotos[:10]):
+                try:
+                    img_url = foto.locator("img").first.get_attribute("src")
+                    
+                    # Hover para activar el cuadro de likes
+                    foto.hover()
+                    page.wait_for_timeout(1000)
+                    
+                    # Capturamos todo el texto del cuadro de la foto
+                    overlay_text = foto.inner_text()
+                    
+                    # Usamos REGEX para buscar solo los números en ese texto
+                    # Esto evita que palabras como "Seguir" o "Mensaje" se metan
+                    numeros_encontrados = re.findall(r'([\d.,]+[KkMm]?)', overlay_text)
+                    
+                    likes = numeros_encontrados[0] if len(numeros_encontrados) > 0 else "0"
+                    comms = numeros_encontrados[1] if len(numeros_encontrados) > 1 else "0"
+                    
+                    posts_info_list.append(f"P{i+1}:({likes}L, {comms}C) URL: {img_url}")
+                except:
+                    continue
 
-            bio_final = " ".join(bio_parts) if bio_parts else "Perfil sin biografía"
+            info_posts_final = " | ".join(posts_info_list) if posts_info_list else "No se detectaron posts"
 
-            print("\n" + "🚀 EXTRACCIÓN EXITOSA ".center(40, "="))
-            print(f"USUARIO:      {target_user}")
-            print(f"NOMBRE REAL:  {nombre_real}")
-            print(f"POSTS:        {posts.group(1) if posts else '0'}")
-            print(f"FOLLOWERS:    {followers.group(1) if followers else '0'}")
-            print(f"FOLLOWING:    {following.group(1) if following else '0'}")
-            print(f"BIO:          {bio_final}")
-
-            import csv
-            import os
-
-            # ... (dentro de la función, después de los print)
-            file_exists = os.path.isfile('perfiles_instagram.csv')
-
-            with open('perfiles_instagram.csv', mode='a', newline='', encoding='utf-8') as file:
+            # --- 4. GUARDADO EN CSV ---
+            file_name = 'perfiles_instagram.csv'
+            file_exists = os.path.isfile(file_name)
+            
+            with open(file_name, mode='a', newline='', encoding='utf-8') as file:
                 writer = csv.writer(file)
-                # Si el archivo es nuevo, escribimos el encabezado
                 if not file_exists:
-                    writer.writerow(['Usuario', 'Nombre Real', 'Posts', 'Followers', 'Following', 'Bio'])
+                    writer.writerow(['Usuario', 'Posts', 'Followers', 'Following', 'Bio', 'Detalle Posts'])
                 
-                writer.writerow([target_user, nombre_real, posts.group(1), followers.group(1), following.group(1), bio_final])
+                writer.writerow([
+                    target_user, 
+                    posts_count.group(1) if posts_count else '0',
+                    followers.group(1) if followers else '0',
+                    following.group(1) if following else '0',
+                    bio_final.replace('\n', ' '), 
+                    info_posts_final
+                ])
 
-            print(f"✅ Datos de {target_user} guardados en perfiles_instagram.csv")
-            
-            # Extra: Si quieres saber quién lo sigue (lo que salía antes)
-            social_proof = [l for l in lines if "sigue esta cuenta" in l.lower()]
-            if social_proof:
-                print(f"SOCIAL PROOF: {social_proof[0]}")
-            
-            print("="*40 + "\n")
+            print(f"✅ ¡Hecho! Datos limpios guardados para {target_user}")
 
         except Exception as e:
-            print(f"Error: {e}")
-
+            print(f"❌ Error crítico: {e}")
         finally:
             browser.close()
-        
 
-scrape_instagram_profile("madeleinecalero")
+scrape_instagram_profile("irene_araceli05")
